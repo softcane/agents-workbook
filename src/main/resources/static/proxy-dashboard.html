@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Workbook trace</title>
+  <link rel="stylesheet" href="/proxy-dashboard.css">
+</head>
+<body>
+  <div class="app">
+    <nav class="sidebar" aria-label="Sessions">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&#8605;</span>
+        <span class="brand-name">Workbook trace</span>
+        <span id="connection" class="status">connecting</span>
+      </div>
+      <p class="tagline">Prompted working notes from proxied Codex and Claude Code requests.</p>
+      <div id="session-list" class="session-list"></div>
+      <p id="empty" class="empty" hidden>No intercepted requests yet.</p>
+    </nav>
+    <main class="panel">
+      <header class="panel-header">
+        <span id="panel-model" class="panel-model">Select a session</span>
+      </header>
+      <div id="turns" class="turns"></div>
+      <p id="panel-empty" class="panel-empty">Choose a session on the left to see its working notes.</p>
+    </main>
+  </div>
+  <template id="day-group-template">
+    <section class="day-group">
+      <p class="day-label"></p>
+      <div class="day-items"></div>
+    </section>
+  </template>
+  <template id="session-item-template">
+    <button type="button" class="session-item">
+      <span class="session-title"></span>
+      <span class="session-meta"><span class="session-model"></span><span class="session-time"></span></span>
+    </button>
+  </template>
+  <template id="turn-template">
+    <section class="turn">
+      <button type="button" class="turn-summary" aria-expanded="false">
+        <span class="turn-caret" aria-hidden="true">&#9656;</span>
+        <span class="turn-number"></span>
+        <span class="turn-label"></span>
+      </button>
+      <pre class="turn-work" hidden></pre>
+      <div class="tool-call" hidden><span class="tool-dot" aria-hidden="true">&#8226;</span><span class="tool-name"></span></div>
+    </section>
+  </template>
+  <script src="/proxy-dashboard.js" defer></script>
+</body>
+</html>

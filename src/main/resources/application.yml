@@ -1,0 +1,37 @@
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8080}
+spring:
+  application:
+    name: agents-workbook
+  codec:
+    max-in-memory-size: ${WORKBOOK_HTTP_MAX_MEMORY:64MB}
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          no-store: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+logging:
+  level:
+    root: INFO
+    io.github.softcane.workbook.proxy: ${WORKBOOK_LOG_LEVEL:INFO}
+workbook-proxy:
+  grpc-address: ${WORKBOOK_GRPC_ADDRESS:127.0.0.1}
+  grpc-port: ${WORKBOOK_GRPC_PORT:50051}
+  internal-base-uri: ${WORKBOOK_INTERNAL_BASE_URI:http://127.0.0.1:10001}
+  upstream-timeout: ${WORKBOOK_UPSTREAM_TIMEOUT:PT5M}
+  hidden-timeout: ${WORKBOOK_HIDDEN_TIMEOUT:PT60S}
+  maximum-request-bytes: ${WORKBOOK_MAX_REQUEST_BYTES:67108864}
+  maximum-concurrent-requests: ${WORKBOOK_MAX_CONCURRENT:8}
+  maximum-workbook-bytes: ${WORKBOOK_MAX_BYTES:262144}
+  maximum-traces: ${WORKBOOK_MAX_TRACES:50}
+  archive-path: ${WORKBOOK_ARCHIVE_PATH:}
+  archive-maximum-bytes: ${WORKBOOK_ARCHIVE_MAX_BYTES:67108864}
+  test-upstream-enabled: ${WORKBOOK_TEST_UPSTREAM_ENABLED:false}
+  note-style: ${WORKBOOK_NOTE_STYLE:REASONING}
+  hidden-effort: ${WORKBOOK_HIDDEN_EFFORT:INHERIT}

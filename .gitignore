@@ -1,0 +1,28 @@
+# Build output
+target/
+*.class
+
+# Captured notes — never commit model-written trace data
+*.jsonl
+*.jsonl.1
+
+# Local environment
+.env
+.env.*
+
+# Editors and OS
+.DS_Store
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# Local workflow scratch, not part of the project
+.verified
+.critic-approved
+HANDOFF.md
+NOTE_PLAN.md
+internal/
+CLAUDE.md

@@ -1,0 +1,11 @@
+# Debug overlay: opens a JDWP port on the app container so IntelliJ can attach.
+# Never use it for anything but local hand-debugging.
+#   ./mvnw -q -o clean package -DskipTests
+#   docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+services:
+  app:
+    environment:
+      # suspend=n so the container comes up without waiting for a debugger.
+      JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+    ports:
+      - "127.0.0.1:5005:5005"

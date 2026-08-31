@@ -1,0 +1,193 @@
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: downstream_proxy
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      per_connection_buffer_limit_bytes: 67108864
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: downstream_proxy
+                request_timeout: 0s
+                stream_idle_timeout: 0s
+                route_config:
+                  name: provider_routes
+                  virtual_hosts:
+                    - name: providers
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            path: "/backend-api/codex/responses"
+                            headers: [{ name: ":method", string_match: { exact: "POST" } }]
+                          route: { cluster: codex_upstream, timeout: 0s, host_rewrite_literal: "chatgpt.com" }
+                        - match:
+                            path: "/v1/messages"
+                            headers: [{ name: ":method", string_match: { exact: "POST" } }]
+                          route: { cluster: claude_upstream, timeout: 0s, host_rewrite_literal: "api.anthropic.com" }
+                        - match: { prefix: "/backend-api/" }
+                          route: { cluster: codex_upstream, timeout: 0s, host_rewrite_literal: "chatgpt.com" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+                        - match: { prefix: "/v1/" }
+                          route: { cluster: claude_upstream, timeout: 0s, host_rewrite_literal: "api.anthropic.com" }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+                        - match: { prefix: "/" }
+                          direct_response: { status: 404 }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc: { cluster_name: ext_proc }
+                        timeout: 0s
+                      failure_mode_allow: false
+                      message_timeout: 600s
+                      max_message_timeout: 600s
+                      send_body_without_waiting_for_header_response: true
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SKIP
+                        request_body_mode: FULL_DUPLEX_STREAMED
+                        response_body_mode: NONE
+                        request_trailer_mode: SEND
+                        response_trailer_mode: SKIP
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    - name: internal_upstream
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10001 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: internal_upstream
+                request_timeout: 0s
+                stream_idle_timeout: 0s
+                route_config:
+                  name: internal_routes
+                  virtual_hosts:
+                    - name: internal
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: "x-workbook-test-upstream", string_match: { exact: "true" } }]
+                          route:
+                            cluster: local_test_upstream
+                            timeout: 0s
+                            regex_rewrite:
+                              pattern: { regex: "^/.*$" }
+                              substitution: "/__test/provider"
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: "x-workbook-provider", string_match: { exact: "codex" } }]
+                          route: { cluster: codex_upstream, timeout: 0s, host_rewrite_literal: "chatgpt.com" }
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: "x-workbook-provider", string_match: { exact: "claude" } }]
+                          route: { cluster: claude_upstream, timeout: 0s, host_rewrite_literal: "api.anthropic.com" }
+                        - match: { prefix: "/" }
+                          direct_response: { status: 404 }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: ext_proc
+      connect_timeout: 2s
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: ext_proc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: app, port_value: 50051 }
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+
+    - name: local_test_upstream
+      connect_timeout: 2s
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: local_test_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: app, port_value: 8080 }
+
+    - name: codex_upstream
+      connect_timeout: 10s
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_PREFERRED
+      load_assignment:
+        cluster_name: codex_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: chatgpt.com, port_value: 443 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: chatgpt.com
+          common_tls_context:
+            validation_context:
+              trusted_ca: { filename: "/etc/ssl/certs/ca-certificates.crt" }
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: { exact: "chatgpt.com" }
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+
+    - name: claude_upstream
+      connect_timeout: 10s
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_PREFERRED
+      load_assignment:
+        cluster_name: claude_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: api.anthropic.com, port_value: 443 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.anthropic.com
+          common_tls_context:
+            validation_context:
+              trusted_ca: { filename: "/etc/ssl/certs/ca-certificates.crt" }
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: { exact: "api.anthropic.com" }
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }

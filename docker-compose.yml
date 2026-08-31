@@ -1,0 +1,38 @@
+services:
+  app:
+    image: agents-workbook-proxy:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      WORKBOOK_GRPC_ADDRESS: 0.0.0.0
+      WORKBOOK_INTERNAL_BASE_URI: http://envoy:10001
+      WORKBOOK_TEST_UPSTREAM_ENABLED: ${WORKBOOK_TEST_UPSTREAM_ENABLED:-false}
+      WORKBOOK_MAX_TRACES: ${WORKBOOK_MAX_TRACES:-50}
+      WORKBOOK_NOTE_STYLE: ${WORKBOOK_NOTE_STYLE:-REASONING}
+      WORKBOOK_HIDDEN_EFFORT: ${WORKBOOK_HIDDEN_EFFORT:-INHERIT}
+      # DEBUG turns on the one-line JSON capture diagnostics. Shapes only, never note content.
+      WORKBOOK_LOG_LEVEL: ${WORKBOOK_LOG_LEVEL:-INFO}
+      # Unset by default: nothing reaches disk unless you name a path. Set it to a path under
+      # /var/lib/workbook to keep captured notes across restarts.
+      WORKBOOK_ARCHIVE_PATH: ${WORKBOOK_ARCHIVE_PATH:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - workbook-archive:/var/lib/workbook
+    restart: unless-stopped
+
+  envoy:
+    image: envoyproxy/envoy:v1.39.0@sha256:d59f7f5fa10cff6d5892b6c5e7df5c9297ddfb2c3683e33fbfb82da24de4fa66
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "127.0.0.1:10000:10000"
+      - "127.0.0.1:10001:10001"
+      - "127.0.0.1:9901:9901"
+    restart: unless-stopped
+
+volumes:
+  workbook-archive:

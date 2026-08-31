@@ -1,0 +1,56 @@
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #0b1010; color: #e6f2ed; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: #0b1010; }
+
+.app { display: flex; height: 100vh; overflow: hidden; }
+
+/* Sidebar */
+.sidebar { width: 300px; flex: none; display: flex; flex-direction: column; border-right: 1px solid #1c332c; background: #0e1615; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 16px; background: #101c1a; border-bottom: 1px solid #1c332c; }
+.brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 7px; background: #14261f; color: #75e7bd; font-size: 15px; }
+.brand-name { font: 700 14px/1.2 ui-monospace, monospace; letter-spacing: .02em; flex: 1; color: #f2fbf7; }
+.status { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #41645a; border-radius: 99px; padding: 3px 9px 3px 8px; color: #a7c6ba; font: 11px ui-monospace, monospace; }
+.status::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #5c7a71; }
+.status[data-state="live"] { border-color: #2f6b52; color: #8fe6bc; background: rgba(58, 155, 111, .1); }
+.status[data-state="live"]::before { background: #4fd88a; box-shadow: 0 0 6px rgba(79, 216, 138, .7); }
+.status[data-state="reconnecting"] { border-color: #6b5a2f; color: #e6c88f; background: rgba(155, 118, 58, .1); }
+.status[data-state="reconnecting"]::before { background: #d8ab4f; }
+.tagline { margin: 0; padding: 12px 16px 14px; color: #6e8980; font-size: 12px; line-height: 1.5; border-bottom: 1px solid #1c332c; }
+
+.session-list { flex: 1; overflow-y: auto; padding: 8px 8px 16px; }
+.day-group + .day-group { margin-top: 14px; }
+.day-label { margin: 0 8px 4px; color: #547067; font: 700 11px/1.4 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .1em; }
+.day-items { display: flex; flex-direction: column; gap: 2px; }
+
+.session-item { display: flex; flex-direction: column; align-items: stretch; gap: 3px; width: 100%; text-align: left; background: none; border: none; border-radius: 8px; padding: 9px 10px; color: inherit; cursor: pointer; font: inherit; }
+.session-item:hover { background: #152220; }
+.session-item.active { background: #1a2b27; }
+.session-title { font-size: 13px; line-height: 1.35; color: #e6f2ed; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-meta { display: flex; gap: 6px; color: #5c7a71; font: 11px ui-monospace, monospace; text-transform: lowercase; }
+.session-meta .session-time::before { content: '·'; margin-right: 6px; }
+
+.empty { color: #6e8980; padding: 24px 16px; text-align: center; font-size: 13px; }
+
+/* Panel */
+.panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.panel-header { padding: 16px 24px; background: #101c1a; border-bottom: 1px solid #1c332c; }
+.panel-model { font: 700 13px/1.2 ui-monospace, monospace; color: #a7c6ba; }
+
+.turns { flex: 1; overflow-y: auto; padding: 20px 24px 40px; max-width: 860px; }
+.panel-empty { color: #6e8980; padding: 48px 24px; text-align: center; }
+
+.turn { border-bottom: 1px solid #16241f; padding: 4px 0; }
+.turn-summary { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: none; padding: 8px 4px; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.turn-summary:hover .turn-label { color: #e6f2ed; }
+.turn-caret { display: inline-block; color: #547067; transition: transform .12s ease; font-size: 11px; }
+.turn.expanded .turn-caret { transform: rotate(90deg); }
+.turn-label { color: #9db5ac; font: 13px ui-monospace, monospace; }
+/* Fixed width so the labels stay left-aligned as the count crosses 9 and 99. */
+.turn-number { flex: none; min-width: 2.2ch; text-align: right; color: #547067; font: 12px ui-monospace, monospace; }
+.turn-work { margin: 0 4px 8px 22px; padding: 10px 12px; background: rgba(15, 27, 25, .7); border: 1px solid #1c332c; border-radius: 8px; white-space: pre-wrap; word-break: break-word; color: #e6f2ed; font: 13px/1.6 ui-monospace, monospace; }
+
+.tool-call { display: flex; align-items: center; gap: 8px; margin: 0 4px 4px 22px; padding: 4px 0; color: #9db5ac; font: 13px ui-monospace, monospace; }
+.tool-call[hidden] { display: none; }
+.tool-dot { color: #75e7bd; }
+.tool-name { color: #e6f2ed; }
