@@ -6,8 +6,6 @@ A local proxy that adds one tool to every request going out of Claude Code or Co
 
 Not a summary. The default wording asks for the decision the model is making, the alternatives it rejected, and what each would have cost, at whatever length the problem earns. Notes run long, and that is the point.
 
-The wording is pointed at the work rather than at the model's own thinking, and deliberately so: asked to "write the thinking itself", Opus 5 refuses the call outright while Sonnet 5 complies. Asked for the decision instead, both answer, and Opus writes the longest notes of any wording tried.
-
 I built this to answer the question like: does an agent's stated plan match what it goes on to do?
 
 ## See it
@@ -21,7 +19,7 @@ I built this to answer the question like: does an agent's stated plan match what
 >
 > Do not use it to distill, mine, or reconstruct reasoning traces from Anthropic's or OpenAI's models. Do not train on what it captures. Do not build a dataset out of it, publish one, or use the notes to reproduce a model's behaviour anywhere else.
 >
-> A workbook note is ordinary model output, written through an ordinary tool call, on your machine, for your session, so that you can watch your own agent work. That is the entire intended use. Harvesting it is a violation of both providers' terms and it is not what this is for.
+> A workbook note is ordinary model output, written through an ordinary tool call, on your machine, for your session, so that you can watch your own agent work. That is the entire intended use. Harvesting it is a violation of both providers' terms, and it is not what this is for.
 
 ## Run it
 
