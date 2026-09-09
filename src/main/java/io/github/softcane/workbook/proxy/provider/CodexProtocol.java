@@ -6,9 +6,14 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 import io.github.softcane.workbook.provider.IncrementalWorkDecoder;
+import io.github.softcane.workbook.proxy.ConversationStateStore;
+import io.github.softcane.workbook.proxy.Sha256;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.Optional;
 import java.util.function.Consumer;
 
@@ -38,30 +43,242 @@ public final class CodexProtocol {
         this.wording = noteStyle.codex();
     }
 
-    /**
-     * Whether this request can carry a hidden workbook exchange at all. Only an input ending on an
-     * assistant turn refuses: that is a prefill, and a forced tool call would abandon the half-written turn
-     * the client asked the model to finish. Such a request is forwarded untouched instead.
-     *
-     * <p>The client's {@code tool_choice} is deliberately not a refusal, whatever it says. Only the hidden
-     * call overrides it; {@link #continueAfterWorkbook} copies the original request, so the client-visible
-     * turn is still bound by the client's own value -- {@code "required"} still demands one of the client's
-     * tools, {@code "none"} still yields no call, and a named function is still the one the model must
-     * call. Refusing capture for those would cost a note and protect nothing.
-     *
-     * <p>{@code previous_response_id} is deliberately not a refusal, and Codex never sends it over HTTP --
-     * it exists only on its WebSocket request, which this proxy does not intercept. The continuation
-     * appends our items to whatever input the client sent, so chaining by id would stay correct anyway:
-     * the hidden response is only ever replayed as items, never referenced by id.
-     */
-    public boolean supportsCapture(ObjectNode original) {
-        return endsOnUserTurn(original.path("input"));
+
+    public ConversationStateStore.RequestContext requestContext(ObjectNode original) {
+        if (!original.path("previous_response_id").asText("").isBlank()) {
+            return unsupportedContext();
+        }
+        JsonNode input = original.path("input");
+        if (input.isTextual()) {
+            return new ConversationStateStore.RequestContext(
+                    ConversationStateStore.RequestKind.OPENING, Set.of(), Set.of());
+        }
+        if (!(input instanceof ArrayNode items) || items.isEmpty()) return unsupportedContext();
+
+        var historyResultIds = new LinkedHashSet<String>();
+        items.forEach(item -> {
+            if (isToolResult(item.path("type").asText())
+                    && !item.path("call_id").asText().isBlank()) {
+                historyResultIds.add(item.path("call_id").asText());
+            }
+        });
+        var trailingResultIds = new LinkedHashSet<String>();
+        for (int index = items.size() - 1; index >= 0; index--) {
+            JsonNode item = items.get(index);
+            String role = item.path("role").asText();
+            if ("system".equals(role) || "developer".equals(role)) continue;
+            if (!isToolResult(item.path("type").asText())) break;
+            String callId = item.path("call_id").asText();
+            if (!callId.isBlank()) trailingResultIds.add(callId);
+        }
+        if (!trailingResultIds.isEmpty()) {
+            return new ConversationStateStore.RequestContext(
+                    ConversationStateStore.RequestKind.TOOL_RESULTS, trailingResultIds, historyResultIds);
+        }
+        return endsOnUserTurn(input)
+                ? new ConversationStateStore.RequestContext(
+                        ConversationStateStore.RequestKind.OPENING, Set.of(), historyResultIds)
+                : unsupportedContext();
+    }
+
+    public String historyFingerprint(ObjectNode request) {
+        var history = json.createObjectNode();
+        if (request.has("previous_response_id")) {
+            history.set("previous_response_id", request.get("previous_response_id").deepCopy());
+        }
+        if (request.has("input")) history.set("input", canonical(request.get("input")));
+        return Sha256.of(json.writeValueAsString(history));
+    }
+
+    public ConversationStateStore.RestoreResult restoreWorkbookHistory(ObjectNode original,
+            List<ConversationStateStore.Boundary> boundaries) {
+        if (!(original.path("input") instanceof ArrayNode)) {
+            return new ConversationStateStore.RestoreResult(original, 0, "ambiguous_anchor");
+        }
+        ObjectNode restored = original.deepCopy();
+        var input = (ArrayNode) restored.path("input");
+        int inserted = 0;
+        for (ConversationStateStore.Boundary boundary : boundaries) {
+            int anchor = uniqueItemId(input, boundary.insertionAnchorId());
+            if (anchor < 0 || !hasCompleteRealBatch(input, anchor, boundary.realToolCallIds())) {
+                return new ConversationStateStore.RestoreResult(original, 0, "ambiguous_anchor");
+            }
+            var expected = exchangeItems(boundary.exchanges());
+            var existingWorkbookIndices = workbookIndices(input, boundary.exchanges());
+            if (existingWorkbookIndices.isEmpty()) {
+                if (!boundary.sourceFingerprint().equals(prefixFingerprint(restored, input, anchor))) {
+                    return new ConversationStateStore.RestoreResult(original, 0, "changed_branch");
+                }
+                input = insertBefore(restored, input, anchor, expected);
+                inserted++;
+                continue;
+            }
+            int start = anchor - expected.size();
+            if (start < 0 || !matches(input, start, expected)
+                    || existingWorkbookIndices.size() != workbookCallCount(boundary.exchanges())) {
+                return new ConversationStateStore.RestoreResult(original, 0, "partial_existing_replay");
+            }
+            if (!boundary.sourceFingerprint().equals(prefixFingerprint(restored, input, start))) {
+                return new ConversationStateStore.RestoreResult(original, 0, "changed_branch");
+            }
+        }
+        return new ConversationStateStore.RestoreResult(restored, inserted, null);
+    }
+
+    public Optional<ConversationStateStore.ToolCall> realToolCall(String event, JsonNode data) {
+        if (!"response.output_item.added".equals(event)) return Optional.empty();
+        JsonNode item = data.path("item");
+        if (!isToolCall(item.path("type").asText())
+                || TOOL_NAME.equals(item.path("name").asText())
+                || item.path("call_id").asText().isBlank()) return Optional.empty();
+        return Optional.of(new ConversationStateStore.ToolCall(
+                item.path("call_id").asText(), item.path("name").asText()));
+    }
+
+    public Optional<String> outputItemId(String event, JsonNode data) {
+        if (!"response.output_item.added".equals(event)) return Optional.empty();
+        String id = data.path("item").path("id").asText();
+        return id.isBlank() ? Optional.empty() : Optional.of(id);
+    }
+
+    private static boolean isToolCall(String type) {
+        return "function_call".equals(type) || "custom_tool_call".equals(type);
+    }
+
+    private static boolean isToolResult(String type) {
+        return "function_call_output".equals(type) || "custom_tool_call_output".equals(type);
+    }
+
+    private ConversationStateStore.RequestContext unsupportedContext() {
+        return new ConversationStateStore.RequestContext(
+                ConversationStateStore.RequestKind.UNSUPPORTED, Set.of(), Set.of());
+    }
+
+    private String prefixFingerprint(ObjectNode request, ArrayNode input, int endExclusive) {
+        var prefix = request.deepCopy();
+        var prefixInput = json.createArrayNode();
+        for (int index = 0; index < endExclusive; index++) prefixInput.add(input.get(index).deepCopy());
+        prefix.set("input", prefixInput);
+        return historyFingerprint(prefix);
+    }
+
+    private ArrayNode insertBefore(ObjectNode request, ArrayNode input, int anchor, ArrayNode additions) {
+        var rebuilt = json.createArrayNode();
+        for (int index = 0; index < anchor; index++) rebuilt.add(input.get(index).deepCopy());
+        additions.forEach(item -> rebuilt.add(item.deepCopy()));
+        for (int index = anchor; index < input.size(); index++) rebuilt.add(input.get(index).deepCopy());
+        request.set("input", rebuilt);
+        return rebuilt;
+    }
+
+    private ArrayNode exchangeItems(List<ConversationStateStore.Exchange> exchanges) {
+        var items = json.createArrayNode();
+        for (ConversationStateStore.Exchange exchange : exchanges) {
+            appendExchange(items, exchange.providerOutput(), exchange.workbookCallId(), exchange.workbookResult());
+        }
+        return items;
+    }
+
+    private void appendExchange(ArrayNode input, ArrayNode output, String callId, String result) {
+        output.forEach(item -> input.add(item.deepCopy()));
+        input.add(json.createObjectNode()
+                .put("type", "function_call_output")
+                .put("call_id", callId)
+                .put("output", result));
+    }
+
+    private static int uniqueItemId(ArrayNode input, String id) {
+        int found = -1;
+        for (int index = 0; index < input.size(); index++) {
+            if (!id.equals(input.get(index).path("id").asText())) continue;
+            if (found >= 0) return -1;
+            found = index;
+        }
+        return found;
+    }
+
+    private static boolean hasCompleteRealBatch(ArrayNode input, int anchor, Set<String> realToolCallIds) {
+        for (String callId : realToolCallIds) {
+            int call = -1;
+            int result = -1;
+            String callType = "";
+            String resultType = "";
+            for (int index = 0; index < input.size(); index++) {
+                JsonNode item = input.get(index);
+                String type = item.path("type").asText();
+                if (isToolCall(type) && callId.equals(item.path("call_id").asText())) {
+                    if (call >= 0) return false;
+                    call = index;
+                    callType = type;
+                }
+                if (isToolResult(type) && callId.equals(item.path("call_id").asText())) {
+                    if (result >= 0) return false;
+                    result = index;
+                    resultType = type;
+                }
+            }
+            if (call < anchor || result <= call || !matchingToolPair(callType, resultType)) return false;
+        }
+        return !realToolCallIds.isEmpty();
+    }
+
+    private static boolean matchingToolPair(String callType, String resultType) {
+        return ("function_call".equals(callType) && "function_call_output".equals(resultType))
+                || ("custom_tool_call".equals(callType) && "custom_tool_call_output".equals(resultType));
+    }
+
+    private static Set<Integer> workbookIndices(ArrayNode input,
+            List<ConversationStateStore.Exchange> exchanges) {
+        var ids = new LinkedHashSet<String>();
+        exchanges.forEach(exchange -> ids.add(exchange.workbookCallId()));
+        var indices = new LinkedHashSet<Integer>();
+        for (int index = 0; index < input.size(); index++) {
+            JsonNode item = input.get(index);
+            if (("function_call".equals(item.path("type").asText())
+                    || "function_call_output".equals(item.path("type").asText()))
+                    && ids.contains(item.path("call_id").asText())) indices.add(index);
+        }
+        return indices;
+    }
+
+    private static int workbookCallCount(List<ConversationStateStore.Exchange> exchanges) {
+        int count = 0;
+        for (ConversationStateStore.Exchange exchange : exchanges) {
+            for (JsonNode item : exchange.providerOutput()) {
+                if ("function_call".equals(item.path("type").asText())
+                        && exchange.workbookCallId().equals(item.path("call_id").asText())) count++;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private static boolean matches(ArrayNode input, int start, ArrayNode expected) {
+        if (start + expected.size() > input.size()) return false;
+        for (int offset = 0; offset < expected.size(); offset++) {
+            if (!input.get(start + offset).equals(expected.get(offset))) return false;
+        }
+        return true;
+    }
+
+    private JsonNode canonical(JsonNode node) {
+        if (node == null || node.isNull() || node.isValueNode()) return node == null ? json.nullNode() : node.deepCopy();
+        if (node.isArray()) {
+            var array = json.createArrayNode();
+            node.forEach(child -> array.add(canonical(child)));
+            return array;
+        }
+        var sorted = new TreeMap<String, JsonNode>();
+        node.properties().forEach(entry -> sorted.put(entry.getKey(), entry.getValue()));
+        var object = json.createObjectNode();
+        sorted.forEach((name, value) -> object.set(name, canonical(value)));
+        return object;
     }
 
     /**
-     * Trailing system and developer items are the client's own and are skipped: they do not change whose
-     * turn it is. A trailing {@code function_call_output} carries no role and is the normal agentic shape,
-     * so only an explicit assistant role refuses. A bare string input is a user turn.
+     * Trailing system and developer items are the client's own and do not change whose turn it is.
+     * Function and custom tool results carry no role and are the normal agentic shape, so only an explicit
+     * assistant role refuses. A bare string input is a user turn.
      */
     private static boolean endsOnUserTurn(JsonNode input) {
         if (input.isTextual()) return true;
@@ -121,13 +338,8 @@ public final class CodexProtocol {
                     .put("role", "user")
                     .set("content", originalInput.deepCopy()));
         }
-        exchanges.forEach(hidden -> {
-            hidden.output().forEach(item -> input.add(item.deepCopy()));
-            input.add(json.createObjectNode()
-                    .put("type", "function_call_output")
-                    .put("call_id", hidden.callId())
-                    .put("output", WORKBOOK_RESULT));
-        });
+        exchanges.forEach(hidden ->
+                appendExchange(input, hidden.output(), hidden.callId(), WORKBOOK_RESULT));
         continuation.set("input", input);
         continuation.put("stream", true);
         return continuation;
@@ -190,6 +402,7 @@ public final class CodexProtocol {
         private final ObjectMapper json;
         private boolean committed;
         private boolean privateWorkbook;
+        private boolean terminal;
 
         private ResponseGate(ObjectMapper json, Consumer<byte[]> release, Consumer<String> visibleDelta,
                 int maximumBufferedBytes) {
@@ -205,28 +418,49 @@ public final class CodexProtocol {
                 release.accept(chunk);
                 return;
             }
-            // Buffered before parsing, so a commit decided part-way through this chunk still flushes the
-            // whole chunk rather than dropping the bytes that decided it.
+            // Buffer the whole chunk before parsing it, and only flush after every event in that chunk
+            // has been seen. A response.completed frame can share a network chunk with the output item
+            // that commits the gate; delaying the flush lets the service persist terminal state first.
             buffered.writeBytes(chunk);
             if (buffered.size() > maximumBufferedBytes) {
                 throw new IllegalArgumentException("Codex response gate exceeded its local buffer limit");
             }
             parser.feed(chunk);
+            flushCommitted();
         }
 
         public boolean committed() {
             return committed;
         }
+        public boolean visibleTerminal() {
+            return terminal && !privateWorkbook;
+        }
 
-        /** The workbook exchange to fold into the next request, or empty once the response was released. */
+
+        /**
+         * Returns a private workbook exchange when one completed. Empty has three possible meanings:
+         * visible bytes were already committed; a visible terminal response is still buffered and requires
+         * {@link #release()}; or EOF supplied no classifying event and requires the original-request fallback.
+         * Callers must distinguish them with {@link #committed()} and {@link #visibleTerminal()}.
+         */
         public Optional<HiddenResult> finish() {
-            if (!committed) parser.finish();
+            if (committed) {
+                flushCommitted();
+                return Optional.empty();
+            }
+            parser.finish();
             if (privateWorkbook) return Optional.of(hidden.finish());
-            commit();
+            flushCommitted();
             return Optional.empty();
         }
 
+        public void release() {
+            commit();
+            flushCommitted();
+        }
         private void onEvent(String event, String data) {
+            if ("response.completed".equals(event)) terminal = true;
+            if (committed) return;
             JsonNode parsed;
             try {
                 parsed = json.readTree(data);
@@ -246,9 +480,12 @@ public final class CodexProtocol {
         }
 
         private void commit() {
-            if (committed) return;
             committed = true;
-            if (buffered.size() > 0) release.accept(buffered.toByteArray());
+        }
+
+        private void flushCommitted() {
+            if (!committed || buffered.size() == 0) return;
+            release.accept(buffered.toByteArray());
             buffered.reset();
         }
     }

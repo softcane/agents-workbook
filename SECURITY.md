@@ -38,6 +38,27 @@ Memory holds the newest 50 turns by default. The dashboard renders model text th
 
 The workbook prompt asks the model to leave secrets out. Treat that as a request, keep credentials out of your prompts, and treat the dashboard as sensitive.
 
+## Workbook continuity state
+
+Cross-request continuity uses a separate in-memory store. It never reads from dashboard traces or the
+optional archive. For each active turn, the store may hold:
+
+- complete provider-native workbook output arrays, including Claude content blocks or Codex response output
+  items, plus the fixed workbook result cue;
+- per-process salted hashes of provider session, thread, and agent identity;
+- deterministic history fingerprints, workbook call IDs, real tool-call IDs, insertion anchor IDs, and
+  boundary sequence numbers.
+
+The store does not persist across a restart. By default each provider keeps continuity disabled. When
+enabled, the store admits at most 64 sessions and 32 boundaries per session, uses at most 32 MiB across all
+sessions, and expires a session after 30 idle minutes. A request that exceeds a boundary or byte limit loses
+its whole continuity session. The proxy does not evict another active session to admit it.
+
+The `workbook.continuity.replay` metric contains provider, outcome, and fixed reason tags. DEBUG
+`continuity.replay` diagnostics contain request kind, counts, and ordered boundary sequence numbers. Neither
+surface contains prompts, note text, credentials, headers, fingerprints, raw session IDs, tool arguments,
+tool results, or provider bodies. Those values also remain excluded from the dashboard archive.
+
 ## Persistence
 
 Leave `WORKBOOK_ARCHIVE_PATH` unset and nothing reaches disk.
@@ -55,6 +76,11 @@ A leaked secret persists on disk, which makes the caveat above matter more here 
 ## Failure policy
 
 Capture is best effort and fails open. When the hidden workbook exchange cannot finish for any reason (an unsupported request shape, a deadline, a missing or malformed call, a provider refusal), the proxy sends your client's own unmodified request and forwards whatever the provider answers. The dashboard marks the turn untraced. Your real task always completes.
+
+Continuity also fails open. Missing identity, missing state, incomplete parallel results, expired state,
+duplicate or concurrent requests, changed history, ambiguous anchors, observer failures, and store limits
+all discard the affected continuity session and send the original request. The proxy never waits for a
+partial result batch.
 
 Falling open costs a second call. The hidden call's tokens are already spent by the time the proxy gives up, and your original request then goes upstream carrying the full history again. A failed capture roughly doubles the turn rather than saving it.
 
@@ -80,5 +106,6 @@ Logs carry an exception's type and its own top-level message, never a cause chai
 - At most two extra private workbook calls are folded into a turn before the client's own request is sent instead.
 - The ungated part of a client-visible response is held in memory up to 1 MiB and never spilled to disk.
 - Unsupported encodings, malformed JSON, and reserved tool collisions return structured local errors. Non-success provider responses do not: they are forwarded verbatim (see **Failure policy**).
+- Continuity defaults to 64 sessions, 32 boundaries per session, 32 MiB total, and a 30-minute idle timeout.
 
 The Java container runs as UID/GID 65532. Envoy and the Java runtime images are digest-pinned. Review and update both digests deliberately when upgrading.

@@ -15,7 +15,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics
 logging:
   level:
     root: INFO
@@ -35,3 +35,9 @@ workbook-proxy:
   test-upstream-enabled: ${WORKBOOK_TEST_UPSTREAM_ENABLED:false}
   note-style: ${WORKBOOK_NOTE_STYLE:REASONING}
   hidden-effort: ${WORKBOOK_HIDDEN_EFFORT:INHERIT}
+  continuity-codex-enabled: ${WORKBOOK_CONTINUITY_CODEX_ENABLED:true}
+  continuity-claude-enabled: ${WORKBOOK_CONTINUITY_CLAUDE_ENABLED:false}
+  continuity-maximum-sessions: ${WORKBOOK_CONTINUITY_MAX_SESSIONS:64}
+  continuity-maximum-boundaries-per-session: ${WORKBOOK_CONTINUITY_MAX_BOUNDARIES_PER_SESSION:32}
+  continuity-maximum-bytes: ${WORKBOOK_CONTINUITY_MAX_BYTES:33554432}
+  continuity-idle-timeout: ${WORKBOOK_CONTINUITY_IDLE_TIMEOUT:PT30M}

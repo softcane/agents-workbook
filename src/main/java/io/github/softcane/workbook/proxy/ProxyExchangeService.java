@@ -10,6 +10,7 @@ import io.github.softcane.workbook.proxy.provider.HiddenEffort;
 import io.github.softcane.workbook.proxy.provider.NoteStyle;
 import io.github.softcane.workbook.proxy.provider.SseParser;
 import io.github.softcane.workbook.proxy.trace.TraceStore;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,6 +27,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -83,6 +85,8 @@ public final class ProxyExchangeService implements AutoCloseable {
 
     private final ObjectMapper json;
     private final TraceStore traces;
+    private final ConversationStateStore conversationState;
+    private final MeterRegistry metrics;
     /**
      * Per-process, so a dashboard session id cannot be walked back to the Claude Code session id that
      * produced it, and so two runs of the proxy never share a grouping key.
@@ -152,6 +156,8 @@ public final class ProxyExchangeService implements AutoCloseable {
     public ProxyExchangeService(
             ObjectMapper json,
             TraceStore traces,
+            ConversationStateStore conversationState,
+            MeterRegistry metrics,
             @Value("${workbook-proxy.internal-base-uri:http://127.0.0.1:10001}") String internalBaseUri,
             @Value("${workbook-proxy.upstream-timeout:PT5M}") Duration timeout,
             @Value("${workbook-proxy.hidden-timeout:PT60S}") Duration hiddenTimeout,
@@ -161,13 +167,17 @@ public final class ProxyExchangeService implements AutoCloseable {
             @Value("${workbook-proxy.test-upstream-enabled:false}") boolean testUpstreamEnabled,
             @Value("${workbook-proxy.note-style:REASONING}") NoteStyle noteStyle,
             @Value("${workbook-proxy.hidden-effort:INHERIT}") HiddenEffort hiddenEffort) {
-        this(json, traces, URI.create(internalBaseUri), new Settings(timeout, hiddenTimeout, maximumConcurrent,
-                maximumWorkbookBytes, maximumRequestBytes, testUpstreamEnabled, noteStyle, hiddenEffort));
+        this(json, traces, conversationState, metrics, URI.create(internalBaseUri),
+                new Settings(timeout, hiddenTimeout, maximumConcurrent, maximumWorkbookBytes,
+                        maximumRequestBytes, testUpstreamEnabled, noteStyle, hiddenEffort));
     }
 
-    public ProxyExchangeService(ObjectMapper json, TraceStore traces, URI internalBaseUri, Settings settings) {
+    public ProxyExchangeService(ObjectMapper json, TraceStore traces, ConversationStateStore conversationState,
+            MeterRegistry metrics, URI internalBaseUri, Settings settings) {
         this.json = json;
         this.traces = traces;
+        this.conversationState = conversationState;
+        this.metrics = metrics;
         this.internalBaseUri = internalBaseUri;
         this.settings = settings;
         this.concurrency = new Semaphore(settings.maximumConcurrentRequests());
@@ -181,6 +191,7 @@ public final class ProxyExchangeService implements AutoCloseable {
                 settings.maximumConcurrentRequests(), settings.noteStyle().label(),
                 settings.hiddenEffort().label(), settings.testUpstreamEnabled());
     }
+
 
     public ExchangeHandle start(ProxyProvider provider, String path, Map<String, List<String>> headers,
             byte[] body, DownstreamSink downstream) {
@@ -237,6 +248,9 @@ public final class ProxyExchangeService implements AutoCloseable {
             throw new IllegalArgumentException("Provider request must be a JSON object");
         }
         trace.setModel(original.path("model").asText(""));
+        JsonNode requestInput = original.path("input");
+        JsonNode requestTail = requestInput.isArray() && !requestInput.isEmpty()
+                ? requestInput.get(requestInput.size() - 1) : json.nullNode();
         Diagnostics.event("request.received",
                 "provider", provider.wireName(),
                 "noteStyle", settings.noteStyle().label(),
@@ -249,6 +263,11 @@ public final class ProxyExchangeService implements AutoCloseable {
                 "hiddenEffort", settings.hiddenEffort().label(),
                 "toolCount", original.path("tools").isArray() ? original.path("tools").size() : 0,
                 "messageCount", original.path("messages").isArray() ? original.path("messages").size() : 0,
+                "inputType", requestInput.getNodeType().toString().toLowerCase(Locale.ROOT),
+                "inputCount", requestInput.isArray() ? requestInput.size() : 0,
+                "inputTailType", requestTail.path("type").asText("absent"),
+                "inputTailRole", requestTail.path("role").asText("absent"),
+                "hasPreviousResponseId", !original.path("previous_response_id").asText("").isBlank(),
                 "stream", original.path("stream").asBoolean(false));
         trace.assignSession(traces.correlateSession(correlationKey(provider, original, headers),
                 previousResponseId(provider, original), trace.sessionId()));
@@ -268,32 +287,127 @@ public final class ProxyExchangeService implements AutoCloseable {
             ObjectNode original, DownstreamSink downstream, TraceStore.TraceHandle trace, ExchangeState state)
             throws Exception {
         // Both protocols stream the client-visible continuation and the response gate reads it as SSE, so
-        // a client that asked for a single JSON body could never be answered through this path. Claude
-        // Code opens an interactive session with exactly that shape -- a one-token unstreamed probe --
-        // and capturing it spent a hidden call the provider only ever refused.
+        // a client that asked for a single JSON body could never be answered through this path.
         if (!original.path("stream").asBoolean(false)) {
             Diagnostics.event("capture.unsupported_stream", "provider", provider.wireName());
             return "unsupported_capture";
         }
+
+        ObjectNode base = original;
+        ContinuityRequest continuity = null;
+        if (conversationState.enabled(provider)) {
+            var context = provider == ProxyProvider.CODEX
+                    ? new CodexProtocol(json, settings.noteStyle()).requestContext(original)
+                    : new ClaudeProtocol(json, settings.noteStyle(), settings.hiddenEffort()).requestContext(original);
+            if (context.kind() == ConversationStateStore.RequestKind.UNSUPPORTED) {
+                continuityOutcome(provider, "skipped", "unsupported", context.kind(), 0, List.of(),
+                        context.trailingResultIds().size(), 0);
+                return "continuity_unsupported";
+            }
+            var key = continuityKey(provider, original, headers);
+            if (key == null) {
+                if (context.kind() == ConversationStateStore.RequestKind.TOOL_RESULTS) {
+                    continuityOutcome(provider, "skipped", "missing_identity", context.kind(), 0, List.of(),
+                            context.trailingResultIds().size(), 0);
+                    return "continuity_missing_identity";
+                }
+            } else {
+                String requestFingerprint = provider == ProxyProvider.CODEX
+                        ? new CodexProtocol(json, settings.noteStyle()).historyFingerprint(original)
+                        : new ClaudeProtocol(json, settings.noteStyle(), settings.hiddenEffort())
+                                .historyFingerprint(original);
+                var begin = conversationState.begin(key, requestFingerprint, context.kind(),
+                        context.trailingResultIds(), context.historyResultIds());
+                if (begin.decision() != ConversationStateStore.Decision.READY) {
+                    String reason = begin.decision().name().toLowerCase(Locale.ROOT);
+                    String outcome = begin.decision() == ConversationStateStore.Decision.DUPLICATE_REQUEST
+                            ? "duplicate" : "skipped";
+                    continuityOutcome(provider, outcome, reason, context.kind(), 0, List.of(),
+                            context.trailingResultIds().size(), 0);
+                    return "continuity_" + reason;
+                }
+                var restored = context.kind() != ConversationStateStore.RequestKind.TOOL_RESULTS
+                        ? new ConversationStateStore.RestoreResult(original, 0, null)
+                        : provider == ProxyProvider.CODEX
+                                ? new CodexProtocol(json, settings.noteStyle())
+                                        .restoreWorkbookHistory(original, begin.replay())
+                                : new ClaudeProtocol(json, settings.noteStyle(), settings.hiddenEffort())
+                                        .restoreWorkbookHistory(original, begin.replay());
+                var sequences = begin.replay().stream()
+                        .map(ConversationStateStore.Boundary::sequence).toList();
+                if (restored.skipReason() != null) {
+                    conversationState.abort(begin.lease(), true);
+                    continuityOutcome(provider, "skipped", restored.skipReason(), context.kind(), 0, sequences,
+                            context.trailingResultIds().size(), 0);
+                    return "continuity_" + restored.skipReason();
+                }
+                base = restored.request();
+                String sourceFingerprint = provider == ProxyProvider.CODEX
+                        ? new CodexProtocol(json, settings.noteStyle()).historyFingerprint(base)
+                        : new ClaudeProtocol(json, settings.noteStyle(), settings.hiddenEffort())
+                                .historyFingerprint(base);
+                continuity = new ContinuityRequest(key, begin.lease(), sourceFingerprint, provider, context.kind(),
+                        context.trailingResultIds().size(), restored.insertedBoundaryCount(), sequences,
+                        new AtomicBoolean());
+                if (context.kind() == ConversationStateStore.RequestKind.TOOL_RESULTS) {
+                    continuityOutcome(provider, restored.insertedBoundaryCount() == 0 ? "duplicate" : "replayed",
+                            restored.insertedBoundaryCount() == 0 ? "already_present" : "history_restored",
+                            context.kind(), restored.insertedBoundaryCount(), sequences,
+                            context.trailingResultIds().size(), 0);
+                }
+            }
+        }
+
         var workbookBytes = new AtomicInteger();
         try {
-            return provider == ProxyProvider.CLAUDE
-                    ? captureClaude(path, headers, original, downstream, trace, state, workbookBytes)
-                    : captureCodex(path, headers, original, downstream, trace, state, workbookBytes);
+            String skipped = provider == ProxyProvider.CLAUDE
+                    ? captureClaude(path, headers, base, downstream, trace, state, workbookBytes, continuity)
+                    : captureCodex(path, headers, base, downstream, trace, state, workbookBytes, continuity);
+            if (skipped != null) abortContinuityOnce(continuity, skipped, 0);
+            return skipped;
         } catch (InterruptedException cancelled) {
+            abortContinuityOnce(continuity, "cancelled", 0);
             throw cancelled;
         } catch (Exception failure) {
-            // Past the client's status line there is no second chance: re-sending would splice a fresh
-            // response onto one the client has already begun reading.
-            if (state.committed.get()) throw failure;
-            logCaptureFallback(provider, failure);
-            return switch (failure) {
+            String reason = switch (failure) {
                 case HttpTimeoutException ignored -> "capture_timeout";
                 case CaptureRefusedException ignored -> "capture_refused";
                 default -> "capture_skipped";
             };
+            abortContinuityOnce(continuity, reason, 0);
+            // Past the client's status line there is no second chance: re-sending would splice a fresh
+            // response onto one the client has already begun reading.
+            if (state.committed.get()) throw failure;
+            logCaptureFallback(provider, failure);
+            return reason;
         }
     }
+
+    private ConversationStateStore.Key continuityKey(ProxyProvider provider, ObjectNode original,
+            Map<String, List<String>> headers) {
+        String identity;
+        if (provider == ProxyProvider.CODEX) {
+            identity = firstHeader(headers, CODEX_SESSION_HEADER);
+            if (identity != null) identity = "session:" + identity;
+            if (identity == null) {
+                identity = firstHeader(headers, CODEX_THREAD_HEADER);
+                if (identity != null) identity = "thread:" + identity;
+            }
+            if (identity == null) identity = codexClientMetadataIdentity(original);
+        } else {
+            String session = firstHeader(headers, CLAUDE_SESSION_HEADER);
+            if (session == null) return null;
+            String agent = firstHeader(headers, CLAUDE_AGENT_HEADER);
+            identity = "session:" + session + ":agent:" + (agent == null ? "root" : agent);
+        }
+        if (identity == null) return null;
+        return new ConversationStateStore.Key(provider, Sha256.of(correlationSalt + '\u0000' + identity));
+    }
+
+    private record ContinuityRequest(ConversationStateStore.Key key, ConversationStateStore.Lease lease,
+            String sourceFingerprint, ProxyProvider provider, ConversationStateStore.RequestKind kind,
+            int returnedToolCount, int insertedBoundaryCount, List<Long> boundarySequences,
+            AtomicBoolean resolved) { }
 
     /**
      * Returns {@code null} once the client's response is committed, or a reason to send the client's own
@@ -303,10 +417,12 @@ public final class ProxyExchangeService implements AutoCloseable {
      */
     private String captureCodex(String path, Map<String, List<String>> headers, ObjectNode original,
             DownstreamSink downstream, TraceStore.TraceHandle trace, ExchangeState state,
-            AtomicInteger workbookBytes) throws Exception {
+            AtomicInteger workbookBytes, ContinuityRequest continuity) throws Exception {
         var toolStarted = new AtomicBoolean();
         var protocol = new CodexProtocol(json, settings.noteStyle());
-        if (!protocol.supportsCapture(original)) {
+        var eligibility = original.deepCopy();
+        eligibility.remove("previous_response_id");
+        if (protocol.requestContext(eligibility).kind() == ConversationStateStore.RequestKind.UNSUPPORTED) {
             Diagnostics.event("codex.capture.unsupported",
                     "inputCount", original.path("input").isArray() ? original.path("input").size() : 0);
             return "unsupported_capture";
@@ -336,12 +452,27 @@ public final class ProxyExchangeService implements AutoCloseable {
                 return new Gate<>() {
                     @Override public void accept(byte[] chunk) { gate.accept(chunk); }
                     @Override public boolean committed() { return gate.committed(); }
+                    @Override public boolean visibleTerminal() { return gate.visibleTerminal(); }
+                    @Override public void release() { gate.release(); }
                     @Override public Optional<CodexProtocol.HiddenResult> finish() { return gate.finish(); }
                 };
             }
             @Override public long inputTokens(CodexProtocol.HiddenResult result) { return result.inputTokens(); }
             @Override public long outputTokens(CodexProtocol.HiddenResult result) { return result.outputTokens(); }
-        }, hidden, trace, path, headers, downstream, state, workbookBytes);
+            @Override public Optional<ConversationStateStore.ToolCall> realToolCall(String event, JsonNode data) {
+                return protocol.realToolCall(event, data);
+            }
+            @Override public Optional<String> outputItemId(String event, JsonNode data) {
+                return protocol.outputItemId(event, data);
+            }
+            @Override public boolean terminalEvent(String event) {
+                return "response.completed".equals(event);
+            }
+            @Override public ConversationStateStore.Exchange exchange(CodexProtocol.HiddenResult result) {
+                return new ConversationStateStore.Exchange(
+                        result.output(), result.callId(), CodexProtocol.WORKBOOK_RESULT);
+            }
+        }, hidden, trace, path, headers, downstream, state, workbookBytes, continuity);
     }
 
     /**
@@ -351,10 +482,10 @@ public final class ProxyExchangeService implements AutoCloseable {
      */
     private String captureClaude(String path, Map<String, List<String>> headers, ObjectNode original,
             DownstreamSink downstream, TraceStore.TraceHandle trace, ExchangeState state,
-            AtomicInteger workbookBytes) throws Exception {
+            AtomicInteger workbookBytes, ContinuityRequest continuity) throws Exception {
         var toolStarted = new AtomicBoolean();
         var protocol = new ClaudeProtocol(json, settings.noteStyle(), settings.hiddenEffort());
-        if (!protocol.supportsCapture(original)) {
+        if (protocol.requestContext(original).kind() == ConversationStateStore.RequestKind.UNSUPPORTED) {
             Diagnostics.event("claude.capture.unsupported",
                     "thinkingType", original.path("thinking").path("type").asText("absent"));
             return "unsupported_capture";
@@ -384,12 +515,27 @@ public final class ProxyExchangeService implements AutoCloseable {
                 return new Gate<>() {
                     @Override public void accept(byte[] chunk) { gate.accept(chunk); }
                     @Override public boolean committed() { return gate.committed(); }
+                    @Override public boolean visibleTerminal() { return gate.visibleTerminal(); }
+                    @Override public void release() { gate.release(); }
                     @Override public Optional<ClaudeProtocol.HiddenResult> finish() { return gate.finish(); }
                 };
             }
             @Override public long inputTokens(ClaudeProtocol.HiddenResult result) { return result.inputTokens(); }
             @Override public long outputTokens(ClaudeProtocol.HiddenResult result) { return result.outputTokens(); }
-        }, hidden, trace, path, headers, downstream, state, workbookBytes);
+            @Override public Optional<ConversationStateStore.ToolCall> realToolCall(String event, JsonNode data) {
+                return protocol.realToolCall(event, data);
+            }
+            @Override public Optional<String> outputItemId(String event, JsonNode data) {
+                return protocol.realToolCall(event, data).map(ConversationStateStore.ToolCall::id);
+            }
+            @Override public boolean terminalEvent(String event) {
+                return "message_stop".equals(event);
+            }
+            @Override public ConversationStateStore.Exchange exchange(ClaudeProtocol.HiddenResult result) {
+                return new ConversationStateStore.Exchange(
+                        result.content(), result.toolUseId(), ClaudeProtocol.WORKBOOK_RESULT);
+            }
+        }, hidden, trace, path, headers, downstream, state, workbookBytes, continuity);
     }
 
     /**
@@ -405,43 +551,110 @@ public final class ProxyExchangeService implements AutoCloseable {
     private <R> String gatedContinuation(ProxyProvider provider, Continuation<R> protocol, R hidden,
             TraceStore.TraceHandle trace, String path,
             Map<String, List<String>> headers, DownstreamSink downstream, ExchangeState state,
-            AtomicInteger workbookBytes) throws Exception {
+            AtomicInteger workbookBytes, ContinuityRequest continuity) throws Exception {
         var exchanges = new ArrayList<R>();
         exchanges.add(hidden);
         for (int attempt = 0; attempt <= MAXIMUM_PRIVATE_LOOPS; attempt++) {
             byte[] body = json.writeValueAsBytes(protocol.body(exchanges));
             var response = new AtomicReference<HttpResult>();
             var sentHeaders = new AtomicBoolean();
-            var toolNames = new SseParser((event, data) ->
-                    observeContinuation(provider, trace, event, parseSseJson(data)));
+            var emittedToolIds = new LinkedHashSet<String>();
+            var insertionAnchor = new AtomicReference<String>();
+            var observerHealthy = new AtomicBoolean(true);
+            var semanticTerminal = new AtomicBoolean();
+            var downstreamEnded = new AtomicBoolean();
+            var observerFinished = new AtomicBoolean();
+            var visibleObserver = new SseParser((event, data) -> {
+                JsonNode parsed = parseSseJson(data);
+                observeContinuation(provider, trace, event, parsed);
+                protocol.outputItemId(event, parsed).ifPresent(id -> insertionAnchor.compareAndSet(null, id));
+                protocol.realToolCall(event, parsed).ifPresent(call -> emittedToolIds.add(call.id()));
+                if (protocol.terminalEvent(event)) semanticTerminal.set(true);
+            });
             try (var keepalive = new Keepalive(downstream)) {
+                Runnable finishVisibleObserver = () -> {
+                    if (!observerFinished.compareAndSet(false, true)) return;
+                    try {
+                        visibleObserver.finish();
+                    } catch (RuntimeException malformed) {
+                        observerHealthy.set(false);
+                    }
+                };
+                Runnable persistOnce = () -> {
+                    if (continuity != null && continuity.resolved().compareAndSet(false, true)) {
+                        persistContinuity(continuity, protocol, exchanges, emittedToolIds,
+                                insertionAnchor.get(), observerHealthy.get());
+                    }
+                };
+                Runnable endDownstream = () -> {
+                    if (downstreamEnded.compareAndSet(false, true)) downstream.body(new byte[0], true);
+                };
                 var gate = protocol.newGate(bytes -> {
                     if (sentHeaders.compareAndSet(false, true)) {
                         HttpResult committed = response.get();
                         downstream.headers(committed.status(), filterResponseHeaders(committed.headers()));
                         state.committed.set(true);
                     }
+                    try {
+                        visibleObserver.feed(bytes);
+                    } catch (RuntimeException malformed) {
+                        observerHealthy.set(false);
+                    }
+                    if (semanticTerminal.get()) {
+                        finishVisibleObserver.run();
+                        persistOnce.run();
+                    }
                     downstream.body(bytes, false);
                     keepalive.sent(bytes);
-                    observeQuietly(() -> toolNames.feed(bytes));
+                    if (semanticTerminal.get()) endDownstream.run();
                 }, delta -> acceptDelta(trace, workbookBytes, delta), MAXIMUM_GATE_BYTES);
                 long expiresAt = System.nanoTime() + settings.hiddenTimeout().toNanos();
-                HttpResult result = exchange(path, headers, body,
-                        bytes -> { if (successful(response.get().status())) gate.accept(bytes); },
-                        state, (status, responseHeaders) -> response.set(new HttpResult(status, responseHeaders)),
-                        settings.hiddenTimeout(), () -> !gate.committed() && System.nanoTime() - expiresAt > 0);
+                HttpResult result;
+                try {
+                    result = exchange(path, headers, body,
+                            bytes -> {
+                                if (!successful(response.get().status())) return;
+                                gate.accept(bytes);
+                                if (gate.visibleTerminal()) semanticTerminal.set(true);
+                                if (semanticTerminal.get()) throw SemanticTerminalReached.INSTANCE;
+                            },
+                            state, (status, responseHeaders) ->
+                                    response.set(new HttpResult(status, responseHeaders)),
+                            settings.hiddenTimeout(),
+                            () -> !gate.committed() && System.nanoTime() - expiresAt > 0);
+                } catch (SemanticTerminalReached completed) {
+                    result = response.get();
+                }
                 if (!successful(result.status())) {
                     logProviderRejection(provider, "continuation", result.status());
                     return "provider_error";
                 }
+                boolean visiblyCommitted = gate.committed();
                 var repeated = gate.finish();
+                visiblyCommitted |= gate.committed();
                 if (repeated.isEmpty()) {
-                    observeQuietly(toolNames::finish);
+                    if (!semanticTerminal.get()) {
+                        finishVisibleObserver.run();
+                        String reason = observerHealthy.get() ? "missing_terminal" : "malformed_observer";
+                        abortContinuityOnce(continuity, reason, emittedToolIds.size());
+                        if (!visiblyCommitted) return reason;
+                        if (!sentHeaders.get()) {
+                            downstream.headers(result.status(), filterResponseHeaders(result.headers()));
+                        }
+                        state.committed.set(true);
+                        endDownstream.run();
+                        log.debug("workbook continuation ended without a semantic terminal event: provider={}",
+                                provider.wireName());
+                        return null;
+                    }
+                    if (!gate.committed()) gate.release();
+                    finishVisibleObserver.run();
                     if (!sentHeaders.get()) {
                         downstream.headers(result.status(), filterResponseHeaders(result.headers()));
                     }
                     state.committed.set(true);
-                    downstream.body(new byte[0], true);
+                    persistOnce.run();
+                    endDownstream.run();
                     log.debug("workbook captured: provider={} exchanges={}", provider.wireName(), exchanges.size());
                     return null;
                 }
@@ -454,6 +667,79 @@ public final class ProxyExchangeService implements AutoCloseable {
         return "capture_loop_exhausted";
     }
 
+    private void abortContinuityOnce(ContinuityRequest continuity, String reason, int emittedToolCount) {
+        if (continuity == null || !continuity.resolved().compareAndSet(false, true)) return;
+        conversationState.abort(continuity.lease(), true);
+        continuityOutcome(continuity, "skipped", reason, emittedToolCount);
+    }
+
+    private <R> void persistContinuity(ContinuityRequest continuity, Continuation<R> protocol,
+            List<R> exchanges, Set<String> emittedToolIds, String insertionAnchor, boolean observerHealthy) {
+        if (continuity == null) return;
+        try {
+            if (!observerHealthy) {
+                conversationState.abort(continuity.lease(), true);
+                continuityOutcome(continuity, "skipped", "malformed_observer", emittedToolIds.size());
+            } else if (emittedToolIds.isEmpty()) {
+                conversationState.commitFinal(continuity.lease());
+                continuityDiagnostic(continuity, "ready", "final_answer", 0);
+            } else if (insertionAnchor == null) {
+                conversationState.abort(continuity.lease(), true);
+                continuityOutcome(continuity, "skipped", "missing_anchor", emittedToolIds.size());
+            } else {
+                var stored = exchanges.stream().map(protocol::exchange).toList();
+                var decision = conversationState.commitTool(continuity.lease(), continuity.sourceFingerprint(),
+                        stored, insertionAnchor, emittedToolIds);
+                if (decision != ConversationStateStore.Decision.READY) {
+                    conversationState.discard(continuity.key());
+                    continuityOutcome(continuity, "skipped",
+                            decision.name().toLowerCase(Locale.ROOT), emittedToolIds.size());
+                } else {
+                    continuityDiagnostic(continuity, "ready", "boundary_committed", emittedToolIds.size());
+                }
+            }
+        } catch (RuntimeException saveFailure) {
+            conversationState.discard(continuity.key());
+            continuityOutcome(continuity, "skipped", "save_failure", emittedToolIds.size());
+        }
+    }
+
+    private void continuityOutcome(ContinuityRequest continuity, String outcome, String reason,
+            int emittedToolCount) {
+        continuityOutcome(continuity.provider(), outcome, reason, continuity.kind(),
+                continuity.insertedBoundaryCount(), continuity.boundarySequences(),
+                continuity.returnedToolCount(), emittedToolCount);
+    }
+
+    private void continuityOutcome(ProxyProvider provider, String outcome, String reason,
+            ConversationStateStore.RequestKind kind, int insertedBoundaryCount, List<Long> boundarySequences,
+            int returnedToolCount, int emittedToolCount) {
+        metrics.counter("workbook.continuity.replay",
+                "provider", provider.wireName(), "outcome", outcome, "reason", reason).increment();
+        Diagnostics.event("continuity.replay",
+                "provider", provider.wireName(),
+                "decision", outcome,
+                "reason", reason,
+                "requestKind", kind.name().toLowerCase(Locale.ROOT),
+                "insertedBoundaryCount", insertedBoundaryCount,
+                "boundarySequences", boundarySequences,
+                "returnedToolCount", returnedToolCount,
+                "emittedToolCount", emittedToolCount);
+    }
+
+    private void continuityDiagnostic(ContinuityRequest continuity, String decision, String reason,
+            int emittedToolCount) {
+        Diagnostics.event("continuity.replay",
+                "provider", continuity.provider().wireName(),
+                "decision", decision,
+                "reason", reason,
+                "requestKind", continuity.kind().name().toLowerCase(Locale.ROOT),
+                "insertedBoundaryCount", continuity.insertedBoundaryCount(),
+                "boundarySequences", continuity.boundarySequences(),
+                "returnedToolCount", continuity.returnedToolCount(),
+                "emittedToolCount", emittedToolCount);
+    }
+
     /** The provider-specific half of {@link #gatedContinuation}: build the body, gate the response. */
     private interface Continuation<R> {
         ObjectNode body(List<R> exchanges);
@@ -463,6 +749,22 @@ public final class ProxyExchangeService implements AutoCloseable {
         long inputTokens(R result);
 
         long outputTokens(R result);
+
+        default Optional<ConversationStateStore.ToolCall> realToolCall(String event, JsonNode data) {
+            return Optional.empty();
+        }
+
+        default Optional<String> outputItemId(String event, JsonNode data) {
+            return Optional.empty();
+        }
+
+        default boolean terminalEvent(String event) {
+            return false;
+        }
+
+        default ConversationStateStore.Exchange exchange(R result) {
+            throw new IllegalStateException("Continuity exchange conversion is not configured");
+        }
     }
 
     /** One provider's response gate, narrowed to what the shared loop needs of it. */
@@ -470,6 +772,8 @@ public final class ProxyExchangeService implements AutoCloseable {
         void accept(byte[] chunk);
 
         boolean committed();
+        boolean visibleTerminal();
+        void release();
 
         Optional<R> finish();
     }
@@ -882,6 +1186,14 @@ public final class ProxyExchangeService implements AutoCloseable {
     }
 
     private record HttpResult(int status, Map<String, List<String>> headers) { }
+
+    private static final class SemanticTerminalReached extends RuntimeException {
+        private static final SemanticTerminalReached INSTANCE = new SemanticTerminalReached();
+
+        private SemanticTerminalReached() {
+            super(null, null, false, false);
+        }
+    }
 
     @FunctionalInterface
     private interface HeaderConsumer {

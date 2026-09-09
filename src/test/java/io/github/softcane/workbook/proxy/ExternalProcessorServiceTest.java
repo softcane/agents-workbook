@@ -7,12 +7,14 @@ import com.google.protobuf.ByteString;
 import com.sun.net.httpserver.HttpServer;
 import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.envoyproxy.envoy.config.core.v3.HeaderValue;
+import io.envoyproxy.envoy.service.ext_proc.v3.ExternalProcessorGrpc;
 import io.envoyproxy.envoy.service.ext_proc.v3.HttpBody;
 import io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingRequest;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingResponse;
 import io.grpc.stub.StreamObserver;
 import io.github.softcane.workbook.proxy.trace.TraceStore;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -36,9 +38,7 @@ class ExternalProcessorServiceTest {
             @Override public void onCompleted() { done.countDown(); }
         };
 
-        try (var exchange = new ProxyExchangeService(new ObjectMapper(), new TraceStore(50),
-                URI.create("http://127.0.0.1:" + upstream.getAddress().getPort()),
-                ProxyExchangeService.Settings.DEFAULTS.withUpstreamTimeout(Duration.ofSeconds(5)))) {
+        try (var exchange = new ProxyExchangeService(new ObjectMapper(), new TraceStore(50), new ConversationStateStore(new ObjectMapper()), new SimpleMeterRegistry(), URI.create("http://127.0.0.1:" + upstream.getAddress().getPort()), ProxyExchangeService.Settings.DEFAULTS.withUpstreamTimeout(Duration.ofSeconds(5)))) {
             var service = new ExternalProcessorService(new ObjectMapper(), exchange, 64L * 1024 * 1024);
             var requests = service.process(observer);
             requests.onNext(ProcessingRequest.newBuilder().setRequestHeaders(HttpHeaders.newBuilder()
@@ -69,6 +69,82 @@ class ExternalProcessorServiceTest {
         assertThat(responses.getLast().getStreamedImmediateResponse().getBodyResponse().getEndOfStream()).isTrue();
     }
 
+    @Test
+    void propagatesRealGrpcCancellationToTheActiveProxyExchange() throws Exception {
+        var upstreamStarted = new CountDownLatch(1);
+        var releaseUpstream = new CountDownLatch(1);
+        var upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        upstream.createContext("/backend-api/codex/responses", http -> {
+            http.getRequestBody().readAllBytes();
+            http.getResponseHeaders().set("content-type", "text/event-stream");
+            http.sendResponseHeaders(200, 0);
+            http.getResponseBody().flush();
+            upstreamStarted.countDown();
+            try {
+                releaseUpstream.await();
+            } catch (InterruptedException cancelled) {
+                Thread.currentThread().interrupt();
+            } finally {
+                http.close();
+            }
+        });
+        upstream.start();
+
+        var traces = new TraceStore(50);
+        io.grpc.Server grpc = null;
+        io.grpc.ManagedChannel channel = null;
+        try (var exchange = new ProxyExchangeService(new ObjectMapper(), traces,
+                new ConversationStateStore(new ObjectMapper()), new SimpleMeterRegistry(),
+                URI.create("http://127.0.0.1:" + upstream.getAddress().getPort()),
+                ProxyExchangeService.Settings.DEFAULTS.withUpstreamTimeout(Duration.ofSeconds(5)))) {
+            var service = new ExternalProcessorService(new ObjectMapper(), exchange, 64L * 1024 * 1024);
+            grpc = io.grpc.ServerBuilder.forPort(0).addService(service).build().start();
+            channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", grpc.getPort())
+                    .usePlaintext().build();
+
+            var clientCall = new java.util.concurrent.atomic.AtomicReference<
+                    io.grpc.stub.ClientCallStreamObserver<ProcessingRequest>>();
+            var clientDone = new CountDownLatch(1);
+            var responseObserver =
+                    new io.grpc.stub.ClientResponseObserver<ProcessingRequest, ProcessingResponse>() {
+                        @Override
+                        public void beforeStart(
+                                io.grpc.stub.ClientCallStreamObserver<ProcessingRequest> requestStream) {
+                            clientCall.set(requestStream);
+                        }
+
+                        @Override public void onNext(ProcessingResponse value) { }
+                        @Override public void onError(Throwable error) { clientDone.countDown(); }
+                        @Override public void onCompleted() { clientDone.countDown(); }
+                    };
+            var requests = ExternalProcessorGrpc.newStub(channel).process(responseObserver);
+            requests.onNext(ProcessingRequest.newBuilder().setRequestHeaders(HttpHeaders.newBuilder()
+                    .setHeaders(headers(
+                            header(":path", "/backend-api/codex/responses"),
+                            header("content-type", "application/json")))).build());
+            requests.onNext(ProcessingRequest.newBuilder().setRequestBody(HttpBody.newBuilder()
+                    .setBody(ByteString.copyFromUtf8("""
+                            {"model":"gpt-test","input":[{"role":"user","content":"hello"}],"stream":true}
+                            """))
+                    .setEndOfStream(true)).build());
+            assertThat(upstreamStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            clientCall.get().cancel("test cancellation", null);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (traces.snapshot().stream().noneMatch(trace -> "cancelled".equals(trace.status()))
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertThat(traces.snapshot()).anySatisfy(trace -> assertThat(trace.status()).isEqualTo("cancelled"));
+            assertThat(clientDone.await(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            releaseUpstream.countDown();
+            if (channel != null) channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+            if (grpc != null) grpc.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+            upstream.stop(0);
+        }
+    }
+
     private HttpServer deterministicUpstream() throws Exception {
         var json = new ObjectMapper();
         var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -76,6 +152,8 @@ class ExternalProcessorServiceTest {
             boolean continuation = json.readTree(exchange.getRequestBody()).toString().contains("function_call_output");
             String wire = continuation
                     ? "event: response.output_text.delta\ndata: {\"delta\":\"final answer\"}\n\n"
+                            + "event: response.completed\n"
+                            + "data: {\"response\":{\"id\":\"resp_final\",\"output\":[]}}\n\n"
                     : """
                       event: response.output_item.added
                       data: {"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"workbook","arguments":""}}

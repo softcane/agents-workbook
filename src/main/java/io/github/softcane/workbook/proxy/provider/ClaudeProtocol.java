@@ -6,11 +6,15 @@ import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 import io.github.softcane.workbook.provider.IncrementalWorkDecoder;
 import io.github.softcane.workbook.proxy.Diagnostics;
+import io.github.softcane.workbook.proxy.ConversationStateStore;
+import io.github.softcane.workbook.proxy.Sha256;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Consumer;
 
@@ -47,21 +51,226 @@ public final class ClaudeProtocol {
         this.hiddenEffort = hiddenEffort;
     }
 
-    /**
-     * Whether this request can carry a hidden workbook exchange at all. Manual extended thinking
-     * ({@code thinking.type = "enabled"}) is refused, and a history ending on an assistant prefill is
-     * refused too: a forced tool call would abandon the half-written turn the client asked the model to
-     * finish. Both are forwarded untouched instead.
-     *
-     * <p>The thinking guard is not about {@code tool_choice}, whatever this comment used to say. Forced
-     * tool use is incompatible with manual extended thinking specifically; adaptive thinking supports it,
-     * which is why capture works today against a client that sends {@code "adaptive"} on every request.
-     * The guard survives because Claude 4.7 and later reject {@code "enabled"} outright -- a client
-     * sending it has a request the provider would refuse before this proxy mattered.
-     */
-    public boolean supportsCapture(ObjectNode original) {
-        if ("enabled".equals(original.path("thinking").path("type").asText())) return false;
-        return original.path("messages") instanceof ArrayNode messages && endsOnUserTurn(messages);
+
+    public ConversationStateStore.RequestContext requestContext(ObjectNode original) {
+        if ("enabled".equals(original.path("thinking").path("type").asText())) return unsupportedContext();
+        if (!(original.path("messages") instanceof ArrayNode messages) || messages.isEmpty()) {
+            return unsupportedContext();
+        }
+        var historyResultIds = new LinkedHashSet<String>();
+        messages.forEach(message -> message.path("content").forEach(block -> {
+            if ("tool_result".equals(block.path("type").asText())
+                    && !block.path("tool_use_id").asText().isBlank()) {
+                historyResultIds.add(block.path("tool_use_id").asText());
+            }
+        }));
+        JsonNode active = null;
+        for (int index = messages.size() - 1; index >= 0; index--) {
+            if ("system".equals(messages.get(index).path("role").asText())) continue;
+            active = messages.get(index);
+            break;
+        }
+        if (active == null || !"user".equals(active.path("role").asText())) return unsupportedContext();
+        var trailingResultIds = new LinkedHashSet<String>();
+        if (active.path("content").isArray()) {
+            for (JsonNode block : active.path("content")) {
+                if (!"tool_result".equals(block.path("type").asText())) break;
+                String id = block.path("tool_use_id").asText();
+                if (!id.isBlank()) trailingResultIds.add(id);
+            }
+        }
+        return new ConversationStateStore.RequestContext(
+                trailingResultIds.isEmpty()
+                        ? ConversationStateStore.RequestKind.OPENING
+                        : ConversationStateStore.RequestKind.TOOL_RESULTS,
+                trailingResultIds, historyResultIds);
+    }
+
+    public String historyFingerprint(ObjectNode request) {
+        var history = json.createObjectNode();
+        if (request.has("messages")) history.set("messages", canonical(request.get("messages")));
+        return Sha256.of(json.writeValueAsString(history));
+    }
+
+    public ConversationStateStore.RestoreResult restoreWorkbookHistory(ObjectNode original,
+            List<ConversationStateStore.Boundary> boundaries) {
+        if (!(original.path("messages") instanceof ArrayNode)) {
+            return new ConversationStateStore.RestoreResult(original, 0, "ambiguous_anchor");
+        }
+        ObjectNode restored = original.deepCopy();
+        var messages = (ArrayNode) restored.path("messages");
+        int inserted = 0;
+        for (ConversationStateStore.Boundary boundary : boundaries) {
+            int anchor = uniqueRealBatchMessage(
+                    messages, boundary.insertionAnchorId(), boundary.realToolCallIds());
+            if (anchor < 0 || !hasFollowingResults(messages, anchor, boundary.realToolCallIds())) {
+                return new ConversationStateStore.RestoreResult(original, 0, "ambiguous_anchor");
+            }
+            var expected = exchangeMessages(boundary.exchanges());
+            var existingWorkbookMessages = workbookMessageIndices(messages, boundary.exchanges());
+            if (existingWorkbookMessages.isEmpty()) {
+                if (!boundary.sourceFingerprint().equals(prefixFingerprint(restored, messages, anchor))) {
+                    return new ConversationStateStore.RestoreResult(original, 0, "changed_branch");
+                }
+                messages = insertBefore(restored, messages, anchor, expected);
+                inserted++;
+                continue;
+            }
+            int start = anchor - expected.size();
+            if (start < 0 || !matches(messages, start, expected)
+                    || existingWorkbookMessages.size() != boundary.exchanges().size() * 2) {
+                return new ConversationStateStore.RestoreResult(original, 0, "partial_existing_replay");
+            }
+            if (!boundary.sourceFingerprint().equals(prefixFingerprint(restored, messages, start))) {
+                return new ConversationStateStore.RestoreResult(original, 0, "changed_branch");
+            }
+        }
+        return new ConversationStateStore.RestoreResult(restored, inserted, null);
+    }
+
+    public Optional<ConversationStateStore.ToolCall> realToolCall(String event, JsonNode data) {
+        if (!"content_block_start".equals(event)) return Optional.empty();
+        JsonNode block = data.path("content_block");
+        if (!"tool_use".equals(block.path("type").asText())
+                || TOOL_NAME.equals(block.path("name").asText())
+                || block.path("id").asText().isBlank()) return Optional.empty();
+        return Optional.of(new ConversationStateStore.ToolCall(
+                block.path("id").asText(), block.path("name").asText()));
+    }
+
+    private ConversationStateStore.RequestContext unsupportedContext() {
+        return new ConversationStateStore.RequestContext(
+                ConversationStateStore.RequestKind.UNSUPPORTED, Set.of(), Set.of());
+    }
+
+    private String prefixFingerprint(ObjectNode request, ArrayNode messages, int endExclusive) {
+        var prefix = request.deepCopy();
+        var prefixMessages = json.createArrayNode();
+        for (int index = 0; index < endExclusive; index++) {
+            prefixMessages.add(messages.get(index).deepCopy());
+        }
+        prefix.set("messages", prefixMessages);
+        return historyFingerprint(prefix);
+    }
+
+    private ArrayNode insertBefore(ObjectNode request, ArrayNode messages, int anchor, ArrayNode additions) {
+        var rebuilt = json.createArrayNode();
+        for (int index = 0; index < anchor; index++) rebuilt.add(messages.get(index).deepCopy());
+        additions.forEach(message -> rebuilt.add(message.deepCopy()));
+        for (int index = anchor; index < messages.size(); index++) rebuilt.add(messages.get(index).deepCopy());
+        request.set("messages", rebuilt);
+        return rebuilt;
+    }
+
+    private ArrayNode exchangeMessages(List<ConversationStateStore.Exchange> exchanges) {
+        var messages = json.createArrayNode();
+        for (ConversationStateStore.Exchange exchange : exchanges) {
+            appendExchange(messages, exchange.providerOutput(),
+                    exchange.workbookCallId(), exchange.workbookResult());
+        }
+        return messages;
+    }
+
+    private void appendExchange(ArrayNode messages, ArrayNode content, String callId, String resultText) {
+        var assistant = json.createObjectNode().put("role", "assistant");
+        assistant.set("content", content.deepCopy());
+        messages.add(assistant);
+        var result = json.createObjectNode()
+                .put("type", "tool_result")
+                .put("tool_use_id", callId)
+                .put("content", resultText);
+        var user = json.createObjectNode().put("role", "user");
+        user.set("content", json.createArrayNode().add(result));
+        messages.add(user);
+    }
+
+    private static int uniqueRealBatchMessage(
+            ArrayNode messages, String insertionAnchorId, Set<String> realToolCallIds) {
+        if (realToolCallIds.isEmpty() || !realToolCallIds.contains(insertionAnchorId)) return -1;
+        var counts = new java.util.HashMap<String, Integer>();
+        int found = -1;
+        for (int index = 0; index < messages.size(); index++) {
+            var ids = new LinkedHashSet<String>();
+            String firstBatchId = null;
+            for (JsonNode block : messages.get(index).path("content")) {
+                if (!"tool_use".equals(block.path("type").asText())) continue;
+                String id = block.path("id").asText();
+                if (realToolCallIds.contains(id)) {
+                    counts.merge(id, 1, Integer::sum);
+                    ids.add(id);
+                    if (firstBatchId == null) firstBatchId = id;
+                }
+            }
+            if (!ids.containsAll(realToolCallIds)) continue;
+            if (!insertionAnchorId.equals(firstBatchId) || found >= 0) return -1;
+            found = index;
+        }
+        if (found < 0 || realToolCallIds.stream().anyMatch(id -> counts.getOrDefault(id, 0) != 1)) return -1;
+        return found;
+    }
+
+    private static boolean hasFollowingResults(ArrayNode messages, int anchor, Set<String> realToolCallIds) {
+        if (anchor + 1 >= messages.size()) return false;
+        JsonNode resultMessage = messages.get(anchor + 1);
+        if (!"user".equals(resultMessage.path("role").asText())
+                || !resultMessage.path("content").isArray()) return false;
+        var results = new LinkedHashSet<String>();
+        for (JsonNode block : resultMessage.path("content")) {
+            if (!"tool_result".equals(block.path("type").asText())) break;
+            results.add(block.path("tool_use_id").asText());
+        }
+        if (!results.equals(realToolCallIds)) return false;
+        for (String id : realToolCallIds) {
+            int count = 0;
+            for (JsonNode message : messages) {
+                for (JsonNode block : message.path("content")) {
+                    if ("tool_result".equals(block.path("type").asText())
+                            && id.equals(block.path("tool_use_id").asText())) count++;
+                }
+            }
+            if (count != 1) return false;
+        }
+        return true;
+    }
+
+    private static Set<Integer> workbookMessageIndices(ArrayNode messages,
+            List<ConversationStateStore.Exchange> exchanges) {
+        var ids = new LinkedHashSet<String>();
+        exchanges.forEach(exchange -> ids.add(exchange.workbookCallId()));
+        var indices = new LinkedHashSet<Integer>();
+        for (int index = 0; index < messages.size(); index++) {
+            for (JsonNode block : messages.get(index).path("content")) {
+                if (("tool_use".equals(block.path("type").asText())
+                        && ids.contains(block.path("id").asText()))
+                        || ("tool_result".equals(block.path("type").asText())
+                        && ids.contains(block.path("tool_use_id").asText()))) indices.add(index);
+            }
+        }
+        return indices;
+    }
+
+    private static boolean matches(ArrayNode messages, int start, ArrayNode expected) {
+        if (start + expected.size() > messages.size()) return false;
+        for (int offset = 0; offset < expected.size(); offset++) {
+            if (!messages.get(start + offset).equals(expected.get(offset))) return false;
+        }
+        return true;
+    }
+
+    private JsonNode canonical(JsonNode node) {
+        if (node == null || node.isNull() || node.isValueNode()) {
+            return node == null ? json.nullNode() : node.deepCopy();
+        }
+        if (node.isArray()) {
+            var array = json.createArrayNode();
+            node.forEach(child -> array.add(canonical(child)));
+            return array;
+        }
+        var sorted = new TreeMap<String, JsonNode>();
+        node.properties().forEach(entry -> sorted.put(entry.getKey(), entry.getValue()));
+        var object = json.createObjectNode();
+        sorted.forEach((name, value) -> object.set(name, canonical(value)));
+        return object;
     }
 
     public ObjectNode forceWorkbook(ObjectNode original) {
@@ -132,18 +341,6 @@ public final class ClaudeProtocol {
         return messages;
     }
 
-    /**
-     * A forced tool call has to answer a user turn rather than continue an assistant prefill. Trailing
-     * system messages are the client's own and are skipped: they do not change whose turn it is.
-     */
-    private static boolean endsOnUserTurn(ArrayNode messages) {
-        for (int index = messages.size() - 1; index >= 0; index--) {
-            String role = messages.get(index).path("role").asText();
-            if ("system".equals(role)) continue;
-            return "user".equals(role);
-        }
-        return false;
-    }
 
     public HiddenStream newHiddenStream(Consumer<String> visibleDelta) {
         return new HiddenStream(json, visibleDelta);
@@ -179,18 +376,8 @@ public final class ClaudeProtocol {
         var continuation = original.deepCopy();
         continuation.set("tools", toolsWithWorkbook(original));
         var messages = copyOfMessages(original);
-        exchanges.forEach(hidden -> {
-            var assistant = json.createObjectNode().put("role", "assistant");
-            assistant.set("content", hidden.content().deepCopy());
-            messages.add(assistant);
-            var resultBlock = json.createObjectNode()
-                    .put("type", "tool_result")
-                    .put("tool_use_id", hidden.toolUseId())
-                    .put("content", WORKBOOK_RESULT);
-            var user = json.createObjectNode().put("role", "user");
-            user.set("content", json.createArrayNode().add(resultBlock));
-            messages.add(user);
-        });
+        exchanges.forEach(hidden ->
+                appendExchange(messages, hidden.content(), hidden.toolUseId(), WORKBOOK_RESULT));
         continuation.set("messages", messages);
         continuation.put("stream", true);
         return continuation;
@@ -247,6 +434,7 @@ public final class ClaudeProtocol {
         private final int maximumBufferedBytes;
         private boolean committed;
         private boolean privateWorkbook;
+        private boolean terminal;
 
         private ResponseGate(ObjectMapper json, Consumer<byte[]> release, Consumer<String> visibleDelta,
                 int maximumBufferedBytes) {
@@ -262,28 +450,48 @@ public final class ClaudeProtocol {
                 release.accept(chunk);
                 return;
             }
-            // Buffered before parsing, so a commit decided part-way through this chunk still flushes the
-            // whole chunk rather than dropping the bytes that decided it.
+            // Do not flush in the middle of parsing a chunk. message_stop can arrive in the same network
+            // chunk as the content block that commits the gate, and continuity must be durable first.
             buffered.writeBytes(chunk);
             if (buffered.size() > maximumBufferedBytes) {
                 throw new IllegalArgumentException("Claude response gate exceeded its local buffer limit");
             }
             parser.feed(chunk);
+            flushCommitted();
         }
 
         public boolean committed() {
             return committed;
         }
+        public boolean visibleTerminal() {
+            return terminal && !privateWorkbook;
+        }
 
-        /** The workbook exchange to fold into the next request, or empty once the response was released. */
+
+        /**
+         * Returns a private workbook exchange when one completed. Empty has three possible meanings:
+         * visible bytes were already committed; a visible terminal response is still buffered and requires
+         * {@link #release()}; or EOF supplied no classifying event and requires the original-request fallback.
+         * Callers must distinguish them with {@link #committed()} and {@link #visibleTerminal()}.
+         */
         public Optional<HiddenResult> finish() {
-            if (!committed) parser.finish();
+            if (committed) {
+                flushCommitted();
+                return Optional.empty();
+            }
+            parser.finish();
             if (privateWorkbook) return Optional.of(hidden.finish());
-            commit();
+            flushCommitted();
             return Optional.empty();
         }
 
+        public void release() {
+            commit();
+            flushCommitted();
+        }
         private void onEvent(String event, String data) {
+            if ("message_stop".equals(event)) terminal = true;
+            if (committed) return;
             JsonNode parsed;
             try {
                 parsed = json.readTree(data);
@@ -303,9 +511,12 @@ public final class ClaudeProtocol {
         }
 
         private void commit() {
-            if (committed) return;
             committed = true;
-            if (buffered.size() > 0) release.accept(buffered.toByteArray());
+        }
+
+        private void flushCommitted() {
+            if (!committed || buffered.size() == 0) return;
+            release.accept(buffered.toByteArray());
             buffered.reset();
         }
     }
@@ -402,7 +613,8 @@ public final class ClaudeProtocol {
                 case "thinking_delta" -> append(block, "thinking", delta.path("thinking").asText());
                 case "signature_delta" -> append(block, "signature", delta.path("signature").asText());
                 case "text_delta" -> append(block, "text", delta.path("text").asText());
-                default -> { }
+                default -> throw new IllegalArgumentException(
+                        "Claude returned an unsupported content-block delta");
             }
         }
 

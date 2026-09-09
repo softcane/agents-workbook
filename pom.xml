@@ -22,7 +22,7 @@
         <maven.version>3.9.11</maven.version>
         <selenium.version>4.44.0</selenium.version>
         <envoy.api.version>1.0.49</envoy.api.version>
-        <grpc.version>1.62.2</grpc.version>
+        <grpc.version>1.80.0</grpc.version>
         <protobuf.version>3.25.1</protobuf.version>
         <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
     </properties>
